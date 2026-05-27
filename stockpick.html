@@ -1,0 +1,918 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black"/>
+<meta name="apple-mobile-web-app-title" content="Stockpick"/>
+<title>Stockpick</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{background:#080b12;color:#e8eaf6;font-family:system-ui,-apple-system,sans-serif;min-height:100%}
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-thumb{background:#1e2535;border-radius:2px}
+input,button{font-family:inherit}
+input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
+.card{background:#0f1117;border:1px solid #1e2535;border-radius:16px;padding:16px;margin-bottom:12px}
+.badge{border-radius:6px;padding:3px 9px;font-size:11px;font-weight:700;letter-spacing:.4px;white-space:nowrap}
+.btn{border:none;border-radius:8px;padding:10px 16px;font-size:13px;font-weight:700;cursor:pointer;min-height:44px;font-family:inherit}
+.btn-primary{background:linear-gradient(135deg,#00d4aa,#0099ff);color:#fff}
+.btn-secondary{background:#1e2535;color:#00d4aa;border:1px solid #2d3748}
+.input{background:#0f1117;border:1px solid #1e2535;border-radius:8px;color:#e8eaf6;padding:12px 14px;font-size:16px;outline:none;width:100%;box-sizing:border-box}
+.mono{font-family:monospace}
+.green{color:#4ade80}.red{color:#f87171}.teal{color:#00d4aa}.gray{color:#6b7899}.dimgray{color:#4a5568}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+// ═══════════════════════════════════════════════
+// STOCKPICK — Standalone Single File App
+// Uses Yahoo Finance via Vercel serverless proxy
+// Falls back to Anthropic API for data if needed
+// ═══════════════════════════════════════════════
+
+const ANTHROPIC_KEY = localStorage.getItem('anthropic_key') || '';
+
+// ── Yahoo Finance via public CORS proxy ──────────
+async function yfSearch(q) {
+  try {
+    const url = `https://corsproxy.io/?${encodeURIComponent(`https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=10&newsCount=0`)}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    return (d?.finance?.result?.[0]?.quotes || []).map(q => ({
+      symbol: q.symbol,
+      name: q.longname || q.shortname || q.symbol,
+      exchange: q.exchDisp || q.exchange || '',
+      market: (q.symbol?.endsWith('.NS') || q.symbol?.endsWith('.BO') || q.exchange==='NSI' || q.exchange==='BSE') ? 'IN' : 'US'
+    }));
+  } catch(e) {
+    console.error('Search error:', e);
+    return [];
+  }
+}
+
+async function yfQuote(symbol) {
+  try {
+    const url = `https://corsproxy.io/?${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=5d`)}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    const meta = d?.chart?.result?.[0]?.meta;
+    if (!meta) return null;
+    const prev = meta.chartPreviousClose || meta.regularMarketPrice;
+    const price = meta.regularMarketPrice;
+    return {
+      symbol, name: meta.longName || meta.shortName || symbol,
+      price, changesPercentage: prev ? ((price-prev)/prev*100) : 0,
+      marketCap: meta.marketCap, pe: meta.trailingPE,
+      eps: meta.epsTrailingTwelveMonths,
+      yearHigh: meta.fiftyTwoWeekHigh, yearLow: meta.fiftyTwoWeekLow,
+      currency: meta.currency || (symbol.endsWith('.NS')?'INR':'USD'),
+      exchange: meta.exchangeName || ''
+    };
+  } catch(e) { console.error('Quote error:', e); return null; }
+}
+
+async function yfHistory(symbol, period) {
+  try {
+    const rangeMap = {'1month':'1mo','3months':'3mo','6months':'6mo','1year':'1y','3years':'3y'};
+    const intMap   = {'1month':'1d','3months':'1d','6months':'1d','1year':'1wk','3years':'1wk'};
+    const range = rangeMap[period]||'1y', interval = intMap[period]||'1wk';
+    const url = `https://corsproxy.io/?${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?range=${range}&interval=${interval}`)}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    const result = d?.chart?.result?.[0];
+    if (!result) return [];
+    const ts = result.timestamp || [];
+    const closes = result.indicators?.quote?.[0]?.close || [];
+    return ts.map((t,i) => ({
+      date: new Date(t*1000).toISOString().split('T')[0].slice(5),
+      price: closes[i] ? parseFloat(closes[i].toFixed(2)) : null
+    })).filter(d => d.price);
+  } catch(e) { return []; }
+}
+
+async function yfSummary(symbol) {
+  try {
+    const mods = 'financialData,defaultKeyStatistics,assetProfile,incomeStatementHistory,price';
+    const url = `https://corsproxy.io/?${encodeURIComponent(`https://query1.finance.yahoo.com/v10/finance/quoteSummary/${symbol}?modules=${mods}`)}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    return d?.quoteSummary?.result?.[0] || {};
+  } catch(e) { return {}; }
+}
+
+// ── Anthropic Claude API ─────────────────────────
+async function claudeAnalysis(symbol, quoteData, summaryData) {
+  const key = localStorage.getItem('anthropic_key');
+  if (!key) return 'Please add your Anthropic API key in Settings to use AI Analysis.';
+  
+  const indian = symbol.endsWith('.NS') || symbol.endsWith('.BO');
+  const curr = indian ? '₹' : '$';
+  const p = summaryData.assetProfile || {};
+  const pr = summaryData.price || {};
+  const fd = summaryData.financialData || {};
+  const ks = summaryData.defaultKeyStatistics || {};
+  const stmts = summaryData.incomeStatementHistory?.incomeStatementHistory || [];
+  const fmtRev = n => !n?'N/A': indian?`₹${(n/1e7).toFixed(0)}Cr`:`$${(n/1e9).toFixed(1)}B`;
+
+  const prompt = `You are a senior equity analyst. Write a research note for ${symbol}.
+
+Company: ${pr.longName||symbol} | Sector: ${p.sector||'N/A'} | Industry: ${p.industry||'N/A'}
+Price: ${curr}${quoteData?.price||'N/A'} | P/E: ${ks.trailingPE?.raw?.toFixed(1)||'N/A'} | Net Margin: ${((fd.profitMargins?.raw||0)*100).toFixed(1)}%
+ROE: ${((fd.returnOnEquity?.raw||0)*100).toFixed(1)}% | D/E: ${fd.debtToEquity?.raw?((fd.debtToEquity.raw)/100).toFixed(2):'N/A'}
+Revenue trend: ${stmts.map(s=>fmtRev(s.totalRevenue?.raw)).join(' → ')}
+${(p.longBusinessSummary||'').slice(0,300)}
+${indian?'Indian company - reference NSE/Nifty context, use ₹':'US company - reference S&P 500 context'}
+
+Write EXACTLY these sections:
+## Business Overview
+## Financial Health
+## Valuation View
+## Growth Outlook
+## Key Risks
+• risk 1
+• risk 2
+• risk 3
+## Research Opinion
+
+Be specific, honest, plain English.`;
+
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01'},
+      body: JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:900,messages:[{role:'user',content:prompt}]})
+    });
+    const d = await r.json();
+    return d?.content?.[0]?.text || 'Analysis unavailable.';
+  } catch(e) { return 'Error: ' + e.message; }
+}
+
+// ── Scoring ──────────────────────────────────────
+function computeScore(summaryData, indian) {
+  const fd = summaryData.financialData || {};
+  const ks = summaryData.defaultKeyStatistics || {};
+  const stmts = summaryData.incomeStatementHistory?.incomeStatementHistory || [];
+  
+  const pe = ks.trailingPE?.raw;
+  const nm = fd.profitMargins?.raw || 0;
+  const roe = fd.returnOnEquity?.raw || 0;
+  const de = fd.debtToEquity?.raw != null ? fd.debtToEquity.raw/100 : 0;
+  const cr = fd.currentRatio?.raw || 1;
+  const dy = ks.dividendYield?.raw || 0;
+  const rg = stmts.length>=2 && stmts[0].totalRevenue?.raw && stmts[1].totalRevenue?.raw
+    ? (stmts[0].totalRevenue.raw - stmts[1].totalRevenue.raw)/Math.abs(stmts[1].totalRevenue.raw) : 0;
+  const eg = stmts.length>=2 && stmts[0].basicEPS?.raw && stmts[1].basicEPS?.raw
+    ? (stmts[0].basicEPS.raw - stmts[1].basicEPS.raw)/Math.abs(stmts[1].basicEPS.raw) : 0;
+  const posE = stmts.filter(s=>(s.netIncome?.raw||0)>0).length;
+
+  const peGood=indian?18:15, peFair=indian?30:25, peHigh=indian?50:40;
+  let v=10;
+  if(pe&&pe>0&&pe<peGood)v+=10; else if(pe&&pe>0&&pe<peFair)v+=6; else if(pe&&pe>0&&pe<peHigh)v+=2; else v-=2;
+  let g=10;
+  if(rg>0.2)g+=6; else if(rg>0.1)g+=4; else if(rg>0)g+=2; else g-=3;
+  if(eg>0.2)g+=4; else if(eg>0)g+=2; else g-=2;
+  let p=10;
+  if(nm>0.2)p+=5; else if(nm>0.1)p+=3; else if(nm>0)p+=1; else p-=4;
+  if(roe>0.2)p+=5; else if(roe>0.1)p+=3; else if(roe>0)p+=1; else p-=3;
+  let d=8;
+  if(de>=0&&de<0.5)d+=5; else if(de<1)d+=3; else if(de<2)d+=1; else d-=3;
+  if(cr>2)d+=2; else if(cr>1)d+=1; else d-=2;
+  const e=Math.max(0,Math.min(10,Math.round(5+(posE/Math.max(stmts.length,1))*5)));
+  const div=dy>0.01&&dy<(indian?0.08:0.06)?5:dy>0?2:0;
+  
+  const scores={valuation:Math.max(0,Math.min(20,v)),growth:Math.max(0,Math.min(20,g)),
+    profitability:Math.max(0,Math.min(20,p)),debt:Math.max(0,Math.min(15,d)),
+    momentum:7,earnings:e,dividend:div};
+  const total=Object.values(scores).reduce((a,b)=>a+b,0);
+  const action=total>=78?'Strong Buy':total>=62?'Buy':total>=45?'Hold':'Avoid';
+  const risks=[];
+  if(pe&&pe>peHigh)risks.push(`High valuation (P/E ${pe.toFixed(0)})`);
+  if(de>2)risks.push('High debt levels');
+  if(nm<0)risks.push('Currently unprofitable');
+  if(cr<1)risks.push('Liquidity risk');
+  if(rg<0)risks.push('Revenue declining');
+  return {total:Math.round(total),max:100,breakdown:scores,action,
+    confidence:total>=78?'High':total>=62?'Medium-High':total>=45?'Medium':'Low',
+    risks,riskRating:d<6||nm<0?'High':total>=60?'Low':'Medium'};
+}
+
+// ── Helpers ──────────────────────────────────────
+const fmt = (n,d=2) => n!=null ? Number(n).toLocaleString('en-IN',{minimumFractionDigits:d,maximumFractionDigits:d}) : '—';
+const fmtB = (n,sym) => {
+  if(n==null) return '—';
+  const c = sym?.endsWith('.NS')||sym?.endsWith('.BO') ? '₹' : '$';
+  if(Math.abs(n)>=1e12) return `${c}${(n/1e12).toFixed(2)}T`;
+  if(Math.abs(n)>=1e9)  return `${c}${(n/1e9).toFixed(1)}B`;
+  if(Math.abs(n)>=1e7)  return `${c}${(n/1e7).toFixed(0)}Cr`;
+  return `${c}${n}`;
+};
+const getCurr = sym => sym?.endsWith('.NS')||sym?.endsWith('.BO') ? '₹' : '$';
+const ACTION_COLORS = {'Strong Buy':'#00d4aa','Buy':'#4ade80','Hold':'#fbbf24','Avoid':'#f87171'};
+const RISK_COLORS   = {Low:'#4ade80',Medium:'#fbbf24',High:'#f87171'};
+
+function normalizeSymbol(s) {
+  s = s.toUpperCase().trim();
+  if(s.endsWith('.NS')||s.endsWith('.BO')) return s;
+  const indian=['RELIANCE','TCS','INFY','HDFCBANK','ICICIBANK','SBIN','WIPRO','HINDUNILVR',
+    'BAJFINANCE','TATAMOTORS','SUNPHARMA','HCLTECH','AXISBANK','KOTAKBANK','BAJAJFINSV',
+    'TITAN','NTPC','ONGC','ADANIENT','TATASTEEL','NESTLEIND','MARUTI','ULTRACEMCO'];
+  if(indian.includes(s)) return s+'.NS';
+  return s;
+}
+
+// ── State ────────────────────────────────────────
+let state = {
+  page: 'dashboard',
+  selectedSymbol: 'AAPL',
+  watchlist: JSON.parse(localStorage.getItem('watchlist')||'["AAPL","RELIANCE.NS","MSFT","TCS.NS"]'),
+  portfolio: JSON.parse(localStorage.getItem('portfolio')||'[]'),
+  quoteCache: {},
+  scoreCache: {},
+  searchResults: [],
+  searchQuery: '',
+  searchOpen: false,
+  searchTab: 'US',
+  detailData: {},
+  loading: {},
+  compareSymbols: ['AAPL','TCS.NS'],
+  compareData: {},
+  analysisText: {},
+  analysisLoading: {},
+  portfolioAdding: false,
+  portfolioForm: {symbol:'',shares:'',buy_price:'',buy_date:'',notes:''},
+  portfolioFilter: 'ALL',
+  chartPeriod: '1year',
+  chartData: {},
+  nextPortfolioId: Date.now(),
+};
+
+function saveWatchlist() { localStorage.setItem('watchlist', JSON.stringify(state.watchlist)); }
+function savePortfolio() { localStorage.setItem('portfolio', JSON.stringify(state.portfolio)); }
+
+// ── Render helpers ───────────────────────────────
+function el(tag, attrs={}, ...children) {
+  const e = document.createElement(tag);
+  for(const [k,v] of Object.entries(attrs)) {
+    if(k==='style' && typeof v==='object') Object.assign(e.style, v);
+    else if(k.startsWith('on')) e[k.toLowerCase()] = v;
+    else if(k==='className') e.className = v;
+    else e.setAttribute(k,v);
+  }
+  for(const c of children.flat()) {
+    if(c==null||c===false) continue;
+    e.appendChild(typeof c==='string'||typeof c==='number' ? document.createTextNode(c) : c);
+  }
+  return e;
+}
+
+function badge(label, color) {
+  return el('span',{className:'badge',style:{background:color+'22',color,border:`1px solid ${color}44`}},label);
+}
+
+function metricCard(label, value, sub, accent) {
+  return el('div',{style:{background:'#0f1117',border:'1px solid #1e2535',borderRadius:12,padding:'14px 16px',flex:'1 1 auto',minWidth:90}},
+    el('div',{style:{color:'#6b7899',fontSize:10,fontWeight:600,letterSpacing:.8,textTransform:'uppercase',marginBottom:5}},label),
+    el('div',{style:{color:accent||'#e8eaf6',fontSize:17,fontWeight:800,fontFamily:'monospace'}},String(value||'—')),
+    sub ? el('div',{style:{color:'#4a5568',fontSize:11,marginTop:2}},sub) : null
+  );
+}
+
+function scoreRing(score, max=100) {
+  const pct=score/max*100, r=40, circ=2*Math.PI*r;
+  const color=pct>=70?'#00d4aa':pct>=50?'#fbbf24':'#f87171';
+  const div=el('div',{style:{position:'relative',width:96,height:96,flexShrink:0}});
+  div.innerHTML=`<svg width="96" height="96" viewBox="0 0 96 96">
+    <circle cx="48" cy="48" r="${r}" fill="none" stroke="#1e2535" stroke-width="7"/>
+    <circle cx="48" cy="48" r="${r}" fill="none" stroke="${color}" stroke-width="7"
+      stroke-dasharray="${circ}" stroke-dashoffset="${circ*(1-pct/100)}"
+      stroke-linecap="round" transform="rotate(-90 48 48)" style="transition:stroke-dashoffset 1s ease"/>
+  </svg>
+  <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center">
+    <div style="font-size:22px;font-weight:900;color:${color};font-family:monospace">${score}</div>
+    <div style="font-size:9px;color:#6b7899">/${max}</div>
+  </div>`;
+  return div;
+}
+
+function breakdownBar(label,val,max,color) {
+  return el('div',{style:{marginBottom:7}},
+    el('div',{style:{display:'flex',justifyContent:'space-between',marginBottom:2}},
+      el('span',{style:{fontSize:11,color:'#8892b0'}},label),
+      el('span',{style:{fontSize:11,fontWeight:700,color,fontFamily:'monospace'}},`${val}/${max}`)
+    ),
+    el('div',{style:{background:'#1e2535',borderRadius:99,height:4,overflow:'hidden'}},
+      el('div',{style:{background:color,width:`${(val/max)*100}%`,height:'100%',borderRadius:99,transition:'width .8s ease'}})
+    )
+  );
+}
+
+// ── Mini chart ───────────────────────────────────
+function renderChart(data, color='#00d4aa', height=160) {
+  if(!data||data.length<2) return el('div',{style:{height:height+'px',display:'flex',alignItems:'center',justifyContent:'center',color:'#4a5568'}},'No chart data');
+  const w=window.innerWidth-64, h=height;
+  const prices=data.map(d=>d.price);
+  const mn=Math.min(...prices), mx=Math.max(...prices);
+  const range=mx-mn||1;
+  const pts=data.map((d,i)=>`${(i/(data.length-1))*w},${h-(d.price-mn)/range*(h-10)-5}`).join(' ');
+  const div=el('div',{style:{width:'100%',overflowX:'hidden'}});
+  div.innerHTML=`<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="display:block">
+    <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="5%" stop-color="${color}" stop-opacity=".15"/>
+      <stop offset="95%" stop-color="${color}" stop-opacity="0"/>
+    </linearGradient></defs>
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round"/>
+    <polygon points="${data.map((d,i)=>`${(i/(data.length-1))*w},${h-(d.price-mn)/range*(h-10)-5}`).join(' ')},${w},${h},0,${h}" fill="url(#g)"/>
+  </svg>`;
+  return div;
+}
+
+// ── Pages ────────────────────────────────────────
+async function loadQuote(sym) {
+  if(state.quoteCache[sym]) return;
+  state.loading[sym]=true; render();
+  const q = await yfQuote(sym);
+  if(q) state.quoteCache[sym]=q;
+  state.loading[sym]=false; render();
+}
+
+async function loadScore(sym) {
+  if(state.scoreCache[sym]) return;
+  const s = await yfSummary(sym);
+  const indian=sym.endsWith('.NS')||sym.endsWith('.BO');
+  state.scoreCache[sym]=computeScore(s, indian);
+  render();
+}
+
+function dashboardPage() {
+  const wl = state.watchlist;
+  if(!wl.length) {
+    return el('div',{style:{textAlign:'center',padding:'80px 0',color:'#4a5568'}},
+      el('div',{style:{fontSize:40,marginBottom:12}},'📊'),
+      el('div',{style:{fontSize:16,color:'#6b7899',marginBottom:6}},'Your watchlist is empty'),
+      el('div',{style:{fontSize:13}},'Tap 🔍 Search to find US or Indian stocks')
+    );
+  }
+  wl.forEach(sym => { loadQuote(sym); loadScore(sym); });
+  const usStocks=wl.filter(s=>!s.endsWith('.NS')&&!s.endsWith('.BO'));
+  const inStocks=wl.filter(s=>s.endsWith('.NS')||s.endsWith('.BO'));
+
+  function stockCard(sym) {
+    const q=state.quoteCache[sym];
+    const sc=state.scoreCache[sym];
+    const curr=getCurr(sym);
+    const isUp=(q?.changesPercentage||0)>=0;
+    const dispSym=sym.replace('.NS','').replace('.BO','');
+    return el('div',{className:'card',style:{cursor:'pointer'},onclick:()=>{state.selectedSymbol=sym;state.page='detail';state.detailData={};state.chartData={};render();}},
+      el('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:10}},
+        el('div',null,
+          el('div',{style:{fontSize:17,fontWeight:900,color:'#00d4aa',fontFamily:'monospace',marginBottom:2}},dispSym),
+          el('div',{style:{fontSize:11,color:'#4a5568'}},q?.name?.slice(0,26)||'Loading...')
+        ),
+        q ? el('div',{style:{textAlign:'right'}},
+          el('div',{style:{fontSize:19,fontWeight:800,color:'#e8eaf6',fontFamily:'monospace'}},`${curr}${fmt(q.price)}`),
+          el('div',{style:{fontSize:12,fontWeight:600,color:isUp?'#4ade80':'#f87171'}},`${isUp?'▲':'▼'} ${Math.abs(q.changesPercentage||0).toFixed(2)}%`)
+        ) : el('div',{style:{color:'#4a5568',fontSize:12}},'Loading…')
+      ),
+      q ? el('div',{style:{display:'flex',gap:16,marginBottom:10}},
+        el('div',null,el('div',{style:{fontSize:9,color:'#4a5568',marginBottom:1}},'MKT CAP'),el('div',{style:{fontSize:12,fontWeight:700,color:'#8892b0'}},fmtB(q.marketCap,sym))),
+        el('div',null,el('div',{style:{fontSize:9,color:'#4a5568',marginBottom:1}},'P/E'),el('div',{style:{fontSize:12,fontWeight:700,color:'#8892b0'}},q.pe?.toFixed(1)||'—')),
+        el('div',null,el('div',{style:{fontSize:9,color:'#4a5568',marginBottom:1}},'EPS'),el('div',{style:{fontSize:12,fontWeight:700,color:'#8892b0'}},q.eps?`${curr}${fmt(q.eps)}`:'—'))
+      ) : null,
+      el('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center'}},
+        el('div',{style:{display:'flex',gap:6,flexWrap:'wrap'}},
+          sc?.action ? badge(sc.action, ACTION_COLORS[sc.action]||'#8892b0') : null,
+          sc?.riskRating ? badge(sc.riskRating+' Risk', RISK_COLORS[sc.riskRating]||'#8892b0') : null
+        ),
+        el('button',{className:'btn',style:{background:'transparent',border:'1px solid #2d3748',color:'#6b7899',padding:'6px 12px',minHeight:36,fontSize:12},
+          onclick:e=>{e.stopPropagation();state.watchlist=state.watchlist.filter(s=>s!==sym);saveWatchlist();render();}},'Remove')
+      )
+    );
+  }
+
+  return el('div',null,
+    inStocks.length ? el('div',null,
+      el('div',{style:{fontSize:11,color:'#ff9933',fontWeight:700,letterSpacing:1,marginBottom:10}},'🇮🇳 INDIAN STOCKS'),
+      ...inStocks.map(stockCard)
+    ) : null,
+    usStocks.length ? el('div',null,
+      el('div',{style:{fontSize:11,color:'#0099ff',fontWeight:700,letterSpacing:1,marginBottom:10}},'🇺🇸 US STOCKS'),
+      ...usStocks.map(stockCard)
+    ) : null
+  );
+}
+
+async function loadDetailData(sym) {
+  if(state.detailData[sym]) return;
+  state.loading['detail']=true; render();
+  const [q, s] = await Promise.all([yfQuote(sym), yfSummary(sym)]);
+  if(q) state.quoteCache[sym]=q;
+  const indian=sym.endsWith('.NS')||sym.endsWith('.BO');
+  state.detailData[sym]={quote:q, summary:s, score:computeScore(s,indian)};
+  state.scoreCache[sym]=state.detailData[sym].score;
+  state.loading['detail']=false;
+  render();
+  // Load chart
+  const hist = await yfHistory(sym, state.chartPeriod);
+  state.chartData[sym+state.chartPeriod]=hist;
+  render();
+}
+
+function detailPage() {
+  const sym=state.selectedSymbol;
+  const d=state.detailData[sym];
+  const curr=getCurr(sym);
+  const dispSym=sym.replace('.NS','').replace('.BO','');
+  const indian=sym.endsWith('.NS')||sym.endsWith('.BO');
+
+  if(!d) { loadDetailData(sym); return el('div',{style:{textAlign:'center',padding:64,color:'#4a5568'}},'Loading '+dispSym+'…'); }
+
+  const q=d.quote, sc=d.score;
+  const profile=d.summary?.assetProfile||{};
+  const price2=d.summary?.price||{};
+  const fd=d.summary?.financialData||{};
+  const ks=d.summary?.defaultKeyStatistics||{};
+  const isUp=(q?.changesPercentage||0)>=0;
+  const inWatch=state.watchlist.includes(sym);
+  const chartKey=sym+state.chartPeriod;
+  const chartData=state.chartData[chartKey];
+  const chartColor=isUp?'#00d4aa':'#f87171';
+
+  const scoreConf=[
+    {key:'valuation',label:'Valuation',max:20},
+    {key:'growth',label:'Growth',max:20},
+    {key:'profitability',label:'Profitability',max:20},
+    {key:'debt',label:'Debt Health',max:15},
+    {key:'momentum',label:'Momentum',max:10},
+    {key:'earnings',label:'Earnings',max:10},
+    {key:'dividend',label:'Dividend',max:5},
+  ];
+
+  return el('div',{style:{display:'flex',flexDirection:'column',gap:16}},
+    // Header
+    el('div',{className:'card'},
+      el('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:8}},
+        el('div',null,
+          el('div',{style:{fontSize:24,fontWeight:900,color:'#e8eaf6',fontFamily:'monospace'}},dispSym),
+          el('div',{style:{color:'#6b7899',fontSize:12,marginTop:2}},price2.longName||price2.shortName||sym),
+          el('div',{style:{color:'#4a5568',fontSize:11}},`${profile.sector||''} · ${profile.industry||''}`)
+        ),
+        q ? el('div',{style:{textAlign:'right'}},
+          el('div',{style:{fontSize:24,fontWeight:900,color:'#e8eaf6',fontFamily:'monospace'}},`${curr}${fmt(q.price)}`),
+          el('div',{style:{fontSize:13,fontWeight:700,color:isUp?'#4ade80':'#f87171'}},`${isUp?'▲':'▼'} ${Math.abs(q.changesPercentage||0).toFixed(2)}% today`)
+        ) : null
+      ),
+      el('div',{style:{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center',justifyContent:'space-between',marginTop:10}},
+        el('div',{style:{display:'flex',gap:6,flexWrap:'wrap'}},
+          sc?.action ? badge(sc.action,ACTION_COLORS[sc.action]||'#8892b0') : null,
+          sc?.riskRating ? badge(sc.riskRating+' Risk',RISK_COLORS[sc.riskRating]||'#8892b0') : null
+        ),
+        el('button',{className:'btn '+(inWatch?'':'btn-primary'),
+          style:inWatch?{background:'#1e2535',color:'#4a5568',cursor:'not-allowed'}:{},
+          onclick:()=>{if(!inWatch){state.watchlist=[...state.watchlist,sym];saveWatchlist();render();}}},
+          inWatch?'✓ Watching':'+ Watchlist')
+      )
+    ),
+    // Metrics grid
+    el('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}},
+      metricCard('Market Cap',fmtB(q?.marketCap,sym)),
+      metricCard('P/E Ratio',ks.trailingPE?.raw?.toFixed(1)||'—'),
+      metricCard('EPS',q?.eps?`${curr}${fmt(q.eps)}`:'—'),
+      metricCard('Net Margin',fd.profitMargins?.raw!=null?`${(fd.profitMargins.raw*100).toFixed(1)}%`:'—'),
+      metricCard('52W High',q?.yearHigh?`${curr}${fmt(q.yearHigh)}`:'—',null,'#4ade80'),
+      metricCard('52W Low',q?.yearLow?`${curr}${fmt(q.yearLow)}`:'—',null,'#f87171'),
+      metricCard('ROE',fd.returnOnEquity?.raw!=null?`${(fd.returnOnEquity.raw*100).toFixed(1)}%`:'—'),
+      metricCard('Debt/Equity',fd.debtToEquity?.raw!=null?(fd.debtToEquity.raw/100).toFixed(2):'—')
+    ),
+    // Score
+    sc ? el('div',{className:'card'},
+      el('div',{style:{display:'flex',alignItems:'center',gap:16,marginBottom:16}},
+        scoreRing(sc.total),
+        el('div',null,
+          el('div',{style:{fontSize:10,color:'#4a5568',letterSpacing:1,marginBottom:3}},'STOCKPICK SCORE'),
+          el('div',{style:{fontSize:20,fontWeight:900,color:ACTION_COLORS[sc.action]||'#e8eaf6'}},sc.action),
+          el('div',{style:{fontSize:12,color:'#6b7899'}},`Confidence: ${sc.confidence}`)
+        )
+      ),
+      ...scoreConf.map(({key,label,max})=>{
+        const val=sc.breakdown[key]||0;
+        const pct=val/max;
+        const color=pct>=.7?'#00d4aa':pct>=.4?'#fbbf24':'#f87171';
+        return breakdownBar(label,val,max,color);
+      }),
+      sc.risks?.length ? el('div',{style:{borderTop:'1px solid #1e2535',paddingTop:10,marginTop:10}},
+        el('div',{style:{fontSize:10,color:'#f87171',fontWeight:700,marginBottom:6,letterSpacing:1}},'KEY RISKS'),
+        ...sc.risks.map(r=>el('div',{style:{fontSize:12,color:'#8892b0',marginBottom:3}},`• ${r}`))
+      ) : null
+    ) : null,
+    // Price chart
+    el('div',{className:'card'},
+      el('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16,flexWrap:'wrap',gap:8}},
+        el('h3',{style:{margin:0,color:'#e8eaf6',fontSize:14,fontWeight:700}},'Price History'),
+        el('div',{style:{display:'flex',gap:3}},
+          ...['1month','3months','6months','1year','3years'].map(p=>
+            el('button',{style:{background:state.chartPeriod===p?'#1e2535':'transparent',color:state.chartPeriod===p?'#00d4aa':'#6b7899',border:`1px solid ${state.chartPeriod===p?'#2d3748':'transparent'}`,borderRadius:6,padding:'5px 8px',fontSize:11,cursor:'pointer',fontWeight:600,minHeight:32},
+              onclick:async()=>{state.chartPeriod=p;render();const h=await yfHistory(sym,p);state.chartData[sym+p]=h;render();}},
+              p.replace('months','M').replace('month','M').replace('year','Y').replace('years','Y'))
+          )
+        )
+      ),
+      chartData ? renderChart(chartData,chartColor) : el('div',{style:{height:160,display:'flex',alignItems:'center',justifyContent:'center',color:'#4a5568'}},'Loading chart…')
+    ),
+    // About
+    profile.longBusinessSummary ? el('div',{className:'card'},
+      el('h3',{style:{margin:'0 0 10px',color:'#e8eaf6',fontSize:14,fontWeight:700}},`About ${price2.longName||sym}`),
+      el('p',{style:{margin:0,color:'#8892b0',fontSize:13,lineHeight:1.7}},profile.longBusinessSummary.slice(0,500)+'…')
+    ) : null,
+    // AI Analysis
+    el('div',{className:'card'},
+      el('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:16,gap:12}},
+        el('div',null,
+          el('h3',{style:{margin:0,color:'#e8eaf6',fontSize:14,fontWeight:700}},'AI Research Analysis'),
+          el('p',{style:{margin:'3px 0 0',color:'#4a5568',fontSize:11}},'Powered by Claude · Not financial advice')
+        ),
+        el('button',{className:'btn btn-primary',style:{flexShrink:0,fontSize:12,padding:'10px 14px'},
+          onclick:async()=>{
+            state.analysisLoading[sym]=true;render();
+            const text=await claudeAnalysis(sym,q,d.summary);
+            state.analysisText[sym]=text;state.analysisLoading[sym]=false;render();
+          }},state.analysisLoading[sym]?'Generating…':state.analysisText[sym]?'Refresh':'Generate')
+      ),
+      state.analysisText[sym] ? el('div',{style:{borderTop:'1px solid #1e2535',paddingTop:14,color:'#8892b0',fontSize:14,lineHeight:1.7}},
+        (() => {
+          const div=el('div');
+          div.innerHTML=state.analysisText[sym]
+            .replace(/## (.+)/g,'<div style="color:#00d4aa;margin:16px 0 6px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;">$1</div>')
+            .replace(/• (.+)/g,'<div style="margin:4px 0;color:#8892b0;padding-left:12px;">• $1</div>')
+            .replace(/\n\n/g,'<div style="height:8px"></div>');
+          return div;
+        })()
+      ) : !state.analysisText[sym] && !state.analysisLoading[sym] ?
+        el('div',{style:{textAlign:'center',padding:'24px 0',color:'#4a5568'}},
+          el('div',{style:{fontSize:28,marginBottom:8}},'🔬'),
+          el('div',{style:{fontSize:13}},`Tap "Generate" for AI research on ${dispSym}`)
+        ) : null
+    )
+  );
+}
+
+function comparePage() {
+  const symbols=state.compareSymbols;
+  symbols.forEach(async sym=>{
+    if(state.compareData[sym]) return;
+    const [q,s]=await Promise.all([yfQuote(sym),yfSummary(sym)]);
+    const indian=sym.endsWith('.NS')||sym.endsWith('.BO');
+    state.compareData[sym]={quote:q,score:computeScore(s,indian),ratios:s?.financialData||{}};
+    render();
+  });
+
+  const metrics=[
+    {label:'Price',get:(d,sym)=>`${getCurr(sym)}${fmt(d.quote?.price)}`},
+    {label:'Daily Chg',get:(d)=>{const v=d.quote?.changesPercentage;return el('span',{style:{color:v>=0?'#4ade80':'#f87171',fontWeight:700}},`${v>=0?'▲':'▼'}${Math.abs(v||0).toFixed(2)}%`);}},
+    {label:'P/E',get:(d)=>d.quote?.pe?.toFixed(1)||'—'},
+    {label:'Score',get:(d)=>el('span',{style:{fontWeight:800,color:'#00d4aa'}},`${d.score?.total||'—'}/100`)},
+    {label:'Signal',get:(d)=>d.score?.action?badge(d.score.action,ACTION_COLORS[d.score.action]):'—'},
+    {label:'Risk',get:(d)=>d.score?.riskRating?badge(d.score.riskRating,RISK_COLORS[d.score.riskRating]):'—'},
+    {label:'Net Margin',get:(d)=>d.ratios?.profitMargins?.raw!=null?`${(d.ratios.profitMargins.raw*100).toFixed(1)}%`:'—'},
+    {label:'ROE',get:(d)=>d.ratios?.returnOnEquity?.raw!=null?`${(d.ratios.returnOnEquity.raw*100).toFixed(1)}%`:'—'},
+  ];
+
+  let newSym='';
+  const addInput=el('input',{className:'input',placeholder:'Add symbol (e.g. NVDA or INFY.NS)',style:{flex:1,minWidth:120},
+    oninput:e=>newSym=e.target.value.toUpperCase(),
+    onkeydown:e=>{if(e.key==='Enter'){const s=normalizeSymbol(newSym);if(s&&!symbols.includes(s)&&symbols.length<4){state.compareSymbols=[...symbols,s];newSym='';render();}}}});
+
+  return el('div',null,
+    el('div',{style:{marginBottom:16}},
+      el('h2',{style:{margin:'0 0 3px',fontSize:24,fontWeight:900,color:'#e8eaf6'}},'Compare'),
+      el('p',{style:{margin:0,color:'#4a5568',fontSize:13}},'Mix US 🇺🇸 and Indian 🇮🇳 stocks')
+    ),
+    el('div',{style:{display:'flex',gap:8,marginBottom:12}},addInput,
+      el('button',{className:'btn btn-secondary',onclick:()=>{const s=normalizeSymbol(newSym);if(s&&!symbols.includes(s)&&symbols.length<4){state.compareSymbols=[...symbols,s];render();}}},'Add')
+    ),
+    el('div',{style:{display:'flex',gap:6,flexWrap:'wrap',marginBottom:14}},
+      ...symbols.map(s=>el('div',{style:{display:'flex',alignItems:'center',gap:5,background:'#1e2535',borderRadius:8,padding:'7px 12px'}},
+        el('span',{style:{color:'#00d4aa',fontWeight:800,fontSize:13,fontFamily:'monospace',cursor:'pointer'},
+          onclick:()=>{state.selectedSymbol=s;state.page='detail';state.detailData={};render();}},s.replace('.NS','').replace('.BO','')),
+        el('button',{style:{background:'none',border:'none',color:'#6b7899',cursor:'pointer',fontSize:16,lineHeight:1,padding:'0 2px',minHeight:24},
+          onclick:()=>{state.compareSymbols=symbols.filter(x=>x!==s);render();}}, '×')
+      ))
+    ),
+    el('div',{style:{overflowX:'auto',WebkitOverflowScrolling:'touch',borderRadius:16,border:'1px solid #1e2535'}},
+      el('table',{style:{borderCollapse:'collapse',minWidth:symbols.length>2?480:'100%',width:'100%'}},
+        el('thead',null,el('tr',{style:{borderBottom:'1px solid #1e2535'}},
+          el('th',{style:{padding:'12px 14px',textAlign:'left',color:'#4a5568',fontSize:11,background:'#0f1117',position:'sticky',left:0,zIndex:1}},'METRIC'),
+          ...symbols.map(s=>el('th',{style:{padding:'12px 14px',textAlign:'center',color:'#00d4aa',fontSize:14,fontWeight:900,fontFamily:'monospace',cursor:'pointer',background:'#0f1117',minWidth:90},
+            onclick:()=>{state.selectedSymbol=s;state.page='detail';state.detailData={};render();}},s.replace('.NS','').replace('.BO','')))
+        )),
+        el('tbody',null,...metrics.map(({label,get},i)=>
+          el('tr',{style:{borderBottom:'1px solid #0a0d14',background:i%2===0?'#0f1117':'#080b12'}},
+            el('td',{style:{padding:'10px 14px',color:'#6b7899',fontSize:12,position:'sticky',left:0,background:i%2===0?'#0f1117':'#080b12',zIndex:1}},label),
+            ...symbols.map(s=>{
+              const d=state.compareData[s];
+              const val=d?get(d,s):null;
+              return el('td',{style:{padding:'10px 14px',textAlign:'center',fontSize:12,color:'#e8eaf6'}},
+                val==null?el('span',{style:{color:'#2d3748'}},'…'):typeof val==='string'?val:val);
+            })
+          )
+        ))
+      )
+    )
+  );
+}
+
+function portfolioPage() {
+  const holdings=state.portfolio;
+  const quotes=state.quoteCache;
+  holdings.forEach(h=>{if(!quotes[h.symbol])loadQuote(h.symbol);});
+
+  const enriched=holdings.map(h=>{
+    const q=quotes[h.symbol];
+    const currentPrice=q?.price||h.buy_price;
+    const currentValue=currentPrice*h.shares;
+    const costBasis=h.buy_price*h.shares;
+    const gainLoss=currentValue-costBasis;
+    return {...h,currentPrice,currentValue,costBasis,gainLoss,gainLossPct:(gainLoss/costBasis)*100,currency:getCurr(h.symbol)};
+  });
+  const filtered=state.portfolioFilter==='ALL'?enriched:enriched.filter(h=>
+    state.portfolioFilter==='IN'?(h.symbol.endsWith('.NS')||h.symbol.endsWith('.BO')):(!h.symbol.endsWith('.NS')&&!h.symbol.endsWith('.BO'))
+  );
+  const totalValue=enriched.reduce((a,h)=>a+h.currentValue,0);
+  const totalCost=enriched.reduce((a,h)=>a+h.costBasis,0);
+  const totalGL=totalValue-totalCost;
+  const totalGLPct=totalCost>0?(totalGL/totalCost)*100:0;
+
+  const inp=(field,placeholder,type='text')=>el('div',null,
+    el('label',{style:{fontSize:11,color:'#4a5568',display:'block',marginBottom:4}},placeholder),
+    el('input',{className:'input',type,placeholder,value:state.portfolioForm[field]||'',
+      oninput:e=>{state.portfolioForm={...state.portfolioForm,[field]:e.target.value};}})
+  );
+
+  return el('div',null,
+    el('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}},
+      el('div',null,
+        el('h2',{style:{margin:'0 0 2px',fontSize:24,fontWeight:900,color:'#e8eaf6'}},'Portfolio'),
+        el('p',{style:{margin:0,color:'#4a5568',fontSize:13}},'US 🇺🇸 & Indian 🇮🇳 holdings')
+      ),
+      el('button',{className:'btn btn-primary',onclick:()=>{state.portfolioAdding=!state.portfolioAdding;render();}},'+ Add')
+    ),
+    el('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:14}},
+      metricCard('Portfolio Value',fmtB(totalValue,'USD')),
+      metricCard('Total Cost',fmtB(totalCost,'USD')),
+      metricCard('Gain/Loss',`${totalGL>=0?'+':''}${fmtB(Math.abs(totalGL),'USD')}`,`${totalGLPct>=0?'+':''}${totalGLPct.toFixed(2)}%`,totalGL>=0?'#4ade80':'#f87171'),
+      metricCard('Positions',holdings.length)
+    ),
+    holdings.length>0 ? el('div',{style:{display:'flex',gap:6,marginBottom:14}},
+      ...['ALL','US','IN'].map(m=>el('button',{style:{background:state.portfolioFilter===m?'#1e2535':'transparent',color:state.portfolioFilter===m?'#e8eaf6':'#4a5568',border:`1px solid ${state.portfolioFilter===m?'#2d3748':'transparent'}`,borderRadius:8,padding:'7px 14px',fontSize:12,fontWeight:700,cursor:'pointer',minHeight:36},
+        onclick:()=>{state.portfolioFilter=m;render();}},m))
+    ) : null,
+    state.portfolioAdding ? el('div',{className:'card',style:{border:'1px solid #2d3748',marginBottom:14}},
+      el('h3',{style:{margin:'0 0 12px',color:'#e8eaf6',fontSize:14}},'Add New Position'),
+      el('div',{style:{display:'flex',flexDirection:'column',gap:10,marginBottom:14}},
+        inp('symbol','Symbol (e.g. AAPL or RELIANCE.NS)'),
+        inp('shares','Shares','number'),
+        inp('buy_price','Buy Price','number'),
+        inp('buy_date','Date Bought','date')
+      ),
+      el('div',{style:{display:'flex',gap:8}},
+        el('button',{className:'btn btn-primary',style:{flex:1},onclick:()=>{
+          const f=state.portfolioForm;
+          if(!f.symbol||!f.shares||!f.buy_price||!f.buy_date) return;
+          const sym=normalizeSymbol(f.symbol);
+          state.portfolio=[...state.portfolio,{id:state.nextPortfolioId++,symbol:sym,shares:parseFloat(f.shares),buy_price:parseFloat(f.buy_price),buy_date:f.buy_date}];
+          state.portfolioForm={symbol:'',shares:'',buy_price:'',buy_date:''};
+          state.portfolioAdding=false;
+          savePortfolio();render();
+        }},'Add'),
+        el('button',{className:'btn',style:{background:'transparent',color:'#6b7899',border:'1px solid #2d3748'},onclick:()=>{state.portfolioAdding=false;render();}},'Cancel')
+      )
+    ) : null,
+    filtered.length===0 ? el('div',{style:{textAlign:'center',padding:'48px 0',color:'#4a5568'}},
+      el('div',{style:{fontSize:36,marginBottom:10}},'💼'),
+      el('div',{style:{fontSize:14}},holdings.length===0?'No positions yet. Tap + Add to start.':`No ${state.portfolioFilter} positions.`)
+    ) : el('div',null,...filtered.map(h=>
+      el('div',{className:'card'},
+        el('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:10}},
+          el('div',null,
+            el('div',{style:{fontSize:17,fontWeight:900,color:'#00d4aa',fontFamily:'monospace'}},h.symbol.replace('.NS','').replace('.BO','')),
+            el('div',{style:{fontSize:11,color:'#4a5568',marginTop:2}},`${h.shares} shares @ ${h.currency}${fmt(h.buy_price)}`)
+          ),
+          el('div',{style:{textAlign:'right'}},
+            el('div',{style:{fontSize:16,fontWeight:800,color:'#e8eaf6',fontFamily:'monospace'}},`${h.currency}${fmt(h.currentValue)}`),
+            el('div',{style:{fontSize:13,fontWeight:700,color:h.gainLoss>=0?'#4ade80':'#f87171'}},
+              `${h.gainLoss>=0?'+':''}${h.currency}${fmt(Math.abs(h.gainLoss))} (${h.gainLossPct>=0?'+':''}${h.gainLossPct.toFixed(1)}%)`)
+          )
+        ),
+        el('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center'}},
+          el('div',{style:{fontSize:12,color:'#6b7899'}},`Current: ${h.currency}${fmt(h.currentPrice)}`),
+          el('button',{className:'btn',style:{background:'transparent',border:'1px solid #2d3748',color:'#6b7899',padding:'6px 12px',minHeight:36,fontSize:12},
+            onclick:()=>{state.portfolio=state.portfolio.filter(x=>x.id!==h.id);savePortfolio();render();}},'Remove')
+        )
+      )
+    ))
+  );
+}
+
+function settingsPage() {
+  const key=localStorage.getItem('anthropic_key')||'';
+  let inputVal=key;
+  const saved=el('div',{style:{display:'none',fontSize:11,color:'#4ade80',marginTop:8,textAlign:'center'}},'✓ Key saved!');
+  const inp=el('input',{className:'input',type:'password',placeholder:'sk-ant-api03-...',value:key,style:{marginBottom:10},
+    oninput:e=>{inputVal=e.target.value;}});
+
+  return el('div',null,
+    el('h2',{style:{margin:'0 0 3px',fontSize:24,fontWeight:900,color:'#e8eaf6'}},'Settings'),
+    el('p',{style:{margin:'0 0 20px',color:'#4a5568',fontSize:13}},'Configure your Stockpick app'),
+    el('div',{style:{display:'flex',flexDirection:'column',gap:14}},
+      el('div',{className:'card',style:{border:'1px solid #00d4aa33'}},
+        el('h3',{style:{margin:'0 0 8px',color:'#00d4aa',fontSize:14,fontWeight:700}},'✅ Stock Data — Free'),
+        el('p',{style:{margin:0,color:'#6b7899',fontSize:13,lineHeight:1.6}},'Stockpick uses Yahoo Finance for live stock data. No API key needed — just search any US or Indian stock.')
+      ),
+      el('div',{className:'card'},
+        el('div',{style:{display:'flex',justifyContent:'space-between',marginBottom:8}},
+          el('h3',{style:{margin:0,color:'#e8eaf6',fontSize:14,fontWeight:700}},'🤖 Anthropic API Key'),
+          el('a',{href:'https://console.anthropic.com',target:'_blank',style:{color:'#00d4aa',fontSize:12,textDecoration:'none'}},'Get key →')
+        ),
+        el('p',{style:{margin:'0 0 12px',color:'#6b7899',fontSize:12,lineHeight:1.5}},'Required for AI Research Analysis. Get a free key at console.anthropic.com'),
+        inp,
+        el('button',{className:'btn btn-primary',style:{width:'100%'},onclick:()=>{
+          localStorage.setItem('anthropic_key',inputVal.trim());
+          saved.style.display='block';
+          setTimeout(()=>saved.style.display='none',2000);
+        }},'Save Key'),
+        saved
+      ),
+      el('div',{className:'card',style:{border:'1px solid #ff993322'}},
+        el('h3',{style:{margin:'0 0 10px',color:'#ff9933',fontSize:14,fontWeight:700}},'🇮🇳 Indian Stock Symbols'),
+        el('div',{style:{fontSize:12,color:'#6b7899',marginBottom:8}},'Use NSE suffix .NS for Indian stocks:'),
+        el('div',{style:{fontSize:12,color:'#ff9933',fontFamily:'monospace',lineHeight:1.8}},'RELIANCE.NS · TCS.NS · INFY.NS · HDFCBANK.NS · ICICIBANK.NS · SBIN.NS · WIPRO.NS · TATAMOTORS.NS')
+      ),
+      el('div',{className:'card',style:{border:'1px solid #0099ff22'}},
+        el('h3',{style:{margin:'0 0 8px',color:'#0099ff',fontSize:14,fontWeight:700}},'🇺🇸 US Stock Symbols'),
+        el('div',{style:{fontSize:12,color:'#6b7899',lineHeight:1.8}},'AAPL · MSFT · GOOGL · NVDA · TSLA · AMZN · META · JPM · V · JNJ · WMT')
+      )
+    )
+  );
+}
+
+// ── Search overlay ───────────────────────────────
+function searchOverlay() {
+  if(!state.searchOpen) return null;
+  const popularUS=['AAPL','MSFT','NVDA','GOOGL','AMZN','TSLA','META','JPM'];
+  const popularIN=['RELIANCE.NS','TCS.NS','HDFCBANK.NS','INFY.NS','ICICIBANK.NS','SBIN.NS','WIPRO.NS','TATAMOTORS.NS'];
+  const popular=state.searchTab==='US'?popularUS:popularIN;
+
+  const overlay=el('div',{style:{position:'fixed',inset:0,background:'#080b12f0',zIndex:500,display:'flex',flexDirection:'column'}});
+
+  const inp=el('input',{style:{flex:1,background:'#0f1117',border:'1px solid #2d3748',borderRadius:12,color:'#e8eaf6',padding:'14px 16px',fontSize:16,outline:'none',WebkitAppearance:'none'},
+    placeholder:'Search symbol or company…',
+    oninput:async e=>{
+      state.searchQuery=e.target.value;
+      if(state.searchQuery.length<1){state.searchResults=[];render();return;}
+      const r=await yfSearch(state.searchQuery);
+      state.searchResults=r;render();
+    }});
+  setTimeout(()=>inp.focus(),100);
+
+  const header=el('div',{style:{padding:'16px 16px 12px',display:'flex',gap:10,alignItems:'center'}},
+    inp,
+    el('button',{className:'btn',style:{background:'#1e2535',color:'#8892b0',flexShrink:0},
+      onclick:()=>{state.searchOpen=false;state.searchQuery='';state.searchResults=[];render();}},'Cancel')
+  );
+
+  const tabs=el('div',{style:{display:'flex',gap:8,padding:'0 16px 12px'}},
+    ...['US','IN'].map(t=>el('button',{style:{background:state.searchTab===t?'#1e2535':'transparent',color:state.searchTab===t?'#e8eaf6':'#4a5568',border:`1px solid ${state.searchTab===t?'#2d3748':'transparent'}`,borderRadius:8,padding:'8px 16px',fontSize:13,fontWeight:700,cursor:'pointer',minHeight:36},
+      onclick:()=>{state.searchTab=t;render();}},t==='US'?'🇺🇸 US Markets':'🇮🇳 India NSE/BSE'))
+  );
+
+  const results=el('div',{style:{flex:1,overflowY:'auto',padding:'0 16px 32px'}});
+
+  if(!state.searchQuery) {
+    const grid=el('div',null,
+      el('div',{style:{fontSize:11,color:'#4a5568',fontWeight:700,letterSpacing:1,marginBottom:10}},`POPULAR ${state.searchTab==='US'?'US':'INDIAN'} STOCKS`),
+      el('div',{style:{display:'flex',flexWrap:'wrap',gap:8}},
+        ...popular.map(sym=>el('button',{className:'btn btn-secondary',style:{fontFamily:'monospace'},
+          onclick:()=>{state.selectedSymbol=sym;state.searchOpen=false;state.page='detail';state.detailData={};state.chartData={};state.searchQuery='';render();}},
+          sym.replace('.NS','').replace('.BO','')))
+      )
+    );
+    results.appendChild(grid);
+  } else if(state.searchResults.length===0) {
+    results.appendChild(el('div',{style:{padding:'20px 0',color:'#4a5568',textAlign:'center',fontSize:14}},`No results for "${state.searchQuery}"`));
+  } else {
+    state.searchResults.forEach(r=>{
+      const row=el('div',{style:{padding:'14px 0',borderBottom:'1px solid #1e2535',display:'flex',gap:12,alignItems:'center',cursor:'pointer'},
+        onclick:()=>{state.selectedSymbol=r.symbol;state.searchOpen=false;state.page='detail';state.detailData={};state.chartData={};state.searchQuery='';render();}},
+        el('div',{style:{minWidth:80}},
+          el('div',{style:{fontWeight:800,color:'#00d4aa',fontFamily:'monospace',fontSize:14}},r.symbol),
+          el('div',{style:{fontSize:10,color:r.market==='IN'?'#ff9933':'#0099ff',marginTop:2}},r.market==='IN'?'🇮🇳 IN':'🇺🇸 US')
+        ),
+        el('div',{style:{flex:1}},
+          el('div',{style:{color:'#e8eaf6',fontSize:13}},r.name),
+          el('div',{style:{color:'#4a5568',fontSize:11,marginTop:2}},r.exchange)
+        )
+      );
+      results.appendChild(row);
+    });
+  }
+
+  overlay.append(header,tabs,results);
+  return overlay;
+}
+
+// ── Main render ──────────────────────────────────
+const navItems=[
+  {id:'dashboard',label:'Home',icon:'⬡'},
+  {id:'watchlist',label:'Watch',icon:'☆'},
+  {id:'compare',label:'Compare',icon:'⇄'},
+  {id:'portfolio',label:'Portfolio',icon:'◈'},
+  {id:'settings',label:'Settings',icon:'⚙'},
+];
+
+function render() {
+  const app=document.getElementById('app');
+  app.innerHTML='';
+
+  // Safe area spacer
+  const spacer=el('div',{style:{height:'env(safe-area-inset-top,44px)',minHeight:44,background:'#080b12',position:'sticky',top:0,zIndex:201}});
+
+  // Header
+  const header=el('header',{style:{borderBottom:'1px solid #1e2535',paddingLeft:16,paddingRight:16,display:'flex',alignItems:'center',justifyContent:'space-between',height:56,position:'sticky',top:'env(safe-area-inset-top,44px)',background:'#080b12',zIndex:200}},
+    el('div',{style:{display:'flex',alignItems:'center',gap:8}},
+      el('div',{style:{width:30,height:30,background:'linear-gradient(135deg,#00d4aa,#0099ff)',borderRadius:8,display:'flex',alignItems:'center',justifyContent:'center',fontSize:15}},'◈'),
+      el('span',{style:{fontWeight:900,fontSize:17,letterSpacing:-.3}},'Stockpick'),
+      el('span',{style:{fontSize:9,color:'#4a5568',marginLeft:4}},'🇺🇸 🇮🇳')
+    ),
+    el('button',{className:'btn',style:{background:'#0f1117',border:'1px solid #1e2535',color:'#6b7899',display:'flex',alignItems:'center',gap:6,minHeight:40,padding:'8px 14px',fontSize:13},
+      onclick:()=>{state.searchOpen=true;render();}},
+      '🔍 Search')
+  );
+
+  // Back button
+  const back = state.page==='detail' ? el('div',{style:{padding:'10px 16px 0'}},
+    el('button',{style:{background:'transparent',border:'none',color:'#00d4aa',fontSize:14,cursor:'pointer',minHeight:36,fontWeight:600},
+      onclick:()=>{state.page='dashboard';render();}},'← Back')
+  ) : null;
+
+  // Main content
+  let content;
+  if(state.page==='dashboard') {
+    content=el('div',null,
+      el('div',{style:{marginBottom:16}},
+        el('h2',{style:{margin:'0 0 2px',fontSize:24,fontWeight:900,color:'#e8eaf6'}},'Dashboard'),
+        el('p',{style:{margin:0,color:'#4a5568',fontSize:13}},'US 🇺🇸 & Indian 🇮🇳 markets')
+      ),
+      dashboardPage()
+    );
+  } else if(state.page==='watchlist') {
+    content=el('div',null,
+      el('div',{style:{marginBottom:14}},
+        el('h2',{style:{margin:'0 0 3px',fontSize:24,fontWeight:900,color:'#e8eaf6'}},'Watchlist'),
+        el('p',{style:{margin:0,color:'#4a5568',fontSize:13}},'Tap a stock to view analysis')
+      ),
+      state.watchlist.length ? el('div',{style:{display:'flex',gap:6,flexWrap:'wrap',marginBottom:14}},
+        ...state.watchlist.map(s=>el('div',{style:{display:'flex',alignItems:'center',gap:5,background:'#1e2535',borderRadius:8,padding:'7px 12px'}},
+          el('span',{style:{color:'#00d4aa',fontWeight:800,fontSize:13,fontFamily:'monospace',cursor:'pointer'},
+            onclick:()=>{state.selectedSymbol=s;state.page='detail';state.detailData={};state.chartData={};render();}},s.replace('.NS','').replace('.BO','')),
+          el('button',{style:{background:'none',border:'none',color:'#6b7899',cursor:'pointer',fontSize:16,lineHeight:1,padding:'0 2px',minHeight:24},
+            onclick:()=>{state.watchlist=state.watchlist.filter(x=>x!==s);saveWatchlist();render();}},'×')
+        ))
+      ) : null,
+      dashboardPage()
+    );
+  } else if(state.page==='detail') {
+    content=detailPage();
+  } else if(state.page==='compare') {
+    content=comparePage();
+  } else if(state.page==='portfolio') {
+    content=portfolioPage();
+  } else if(state.page==='settings') {
+    content=settingsPage();
+  }
+
+  const main=el('main',{style:{padding:'16px 16px 0',maxWidth:640,margin:'0 auto'}},content);
+
+  // Bottom nav
+  const nav=el('nav',{style:{position:'fixed',bottom:0,left:0,right:0,background:'#080b12ee',backdropFilter:'blur(16px)',WebkitBackdropFilter:'blur(16px)',borderTop:'1px solid #1e2535',display:'flex',zIndex:300,paddingBottom:'env(safe-area-inset-bottom,0px)'}},
+    ...navItems.map(n=>el('button',{style:{flex:1,background:'transparent',border:'none',color:state.page===n.id?'#00d4aa':'#4a5568',cursor:'pointer',padding:'10px 0 8px',display:'flex',flexDirection:'column',alignItems:'center',gap:2,transition:'color .15s',minHeight:56},
+      onclick:()=>{state.page=n.id;render();}},
+      el('span',{style:{fontSize:18,lineHeight:1}},n.icon),
+      el('span',{style:{fontSize:9,fontWeight:state.page===n.id?700:500,letterSpacing:.3}},n.label)
+    ))
+  );
+
+  app.append(spacer,header);
+  if(back) app.append(back);
+  app.append(main,nav);
+
+  const overlay=searchOverlay();
+  if(overlay) app.append(overlay);
+}
+
+// Start
+render();
+</script>
+</body>
+</html>
